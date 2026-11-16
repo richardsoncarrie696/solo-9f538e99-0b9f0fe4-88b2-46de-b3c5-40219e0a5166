@@ -31,16 +31,26 @@ class Resolution:
     reachable: set[str] = field(default_factory=set)
 
 
-def resolve_name(
+@dataclass
+class EndpointAnalysis:
+    """名称可达子图的终点分析（供供数解析与丰富度分析共用）。"""
+
+    reachable: set[str] = field(default_factory=set)
+    has_cycle: bool = False
+    accepted_terminals: list[str] = field(default_factory=list)
+    non_accepted_terminals: list[str] = field(default_factory=list)
+
+
+def analyze_endpoints(
     start: str,
     adjacency: dict[str, list[str]],
     accepted: set[str],
-) -> Resolution:
-    """解析单个名称。
+) -> EndpointAnalysis:
+    """求 ``start`` 可达子图的拓扑属性与全部“终点”（出度为 0 的节点）。
 
-    :param start: 观测中的物种名
-    :param adjacency: 名称 -> 指向的名称列表（分叉即一个键对应多个值）
-    :param accepted: 接受名集合
+    - 终点可能在接受名集合内，也可能不在；
+    - 只要可达子图存在环，``has_cycle`` 为真；
+    - ``accepted_terminals`` / ``non_accepted_terminals`` 均按名称排序。
     """
     # 1. 可达性 BFS
     reachable: set[str] = set()
@@ -75,14 +85,36 @@ def resolve_name(
                     queue.append(nxt)
     has_cycle = visited_count < len(reachable)
 
-    # 3. 汇聚点：可达子图中无出边（或出边全部指向子图外，本图结构下不会发生）的节点
+    # 3. 汇聚点：可达子图中无出边的节点
     sinks = sorted(
         node
         for node in reachable
         if not any(nxt in reachable for nxt in adjacency.get(node, ()))
     )
-    sink_accepted = sorted({node for node in sinks if node in accepted})
-    non_accepted_sinks = [node for node in sinks if node not in accepted]
+    return EndpointAnalysis(
+        reachable=reachable,
+        has_cycle=has_cycle,
+        accepted_terminals=[node for node in sinks if node in accepted],
+        non_accepted_terminals=[node for node in sinks if node not in accepted],
+    )
+
+
+def resolve_name(
+    start: str,
+    adjacency: dict[str, list[str]],
+    accepted: set[str],
+) -> Resolution:
+    """解析单个名称。
+
+    :param start: 观测中的物种名
+    :param adjacency: 名称 -> 指向的名称列表（分叉即一个键对应多个值）
+    :param accepted: 接受名集合
+    """
+    endpoints = analyze_endpoints(start, adjacency, accepted)
+    reachable = endpoints.reachable
+    has_cycle = endpoints.has_cycle
+    sink_accepted = endpoints.accepted_terminals
+    non_accepted_sinks = endpoints.non_accepted_terminals
 
     if has_cycle:
         return Resolution(

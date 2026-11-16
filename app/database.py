@@ -68,6 +68,51 @@ CREATE TABLE IF NOT EXISTS result_item (
     reason           TEXT,
     PRIMARY KEY (result_id, line_no)
 );
+
+-- 丰富度分析：固定来源供数结果（及其分类修订），保存分析时的完整范围与上下界见证。
+-- 分析只读来源结果，不改动任何 result / result_item 行。
+CREATE TABLE IF NOT EXISTS richness_analysis (
+    analysis_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    result_id              INTEGER NOT NULL REFERENCES result(result_id),
+    revision_id            INTEGER NOT NULL REFERENCES taxonomy_revision(revision_id),
+    status                 TEXT NOT NULL CHECK (status IN ('active', 'expired')),
+    observation_name_count INTEGER NOT NULL,
+    candidate_name_count   INTEGER NOT NULL,
+    lower_bound            INTEGER NOT NULL,
+    upper_bound            INTEGER NOT NULL,
+    created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_richness_analysis_result
+    ON richness_analysis(result_id, status);
+
+CREATE TABLE IF NOT EXISTS richness_analysis_name (
+    analysis_id          INTEGER NOT NULL REFERENCES richness_analysis(analysis_id) ON DELETE CASCADE,
+    observation_name     TEXT NOT NULL,
+    candidate_names_json TEXT NOT NULL,
+    fixed_attribution    INTEGER NOT NULL CHECK (fixed_attribution IN (0, 1)),
+    PRIMARY KEY (analysis_id, observation_name)
+);
+
+CREATE TABLE IF NOT EXISTS richness_analysis_observation (
+    analysis_id          INTEGER NOT NULL REFERENCES richness_analysis(analysis_id) ON DELETE CASCADE,
+    line_no              INTEGER NOT NULL,
+    observation_code     TEXT NOT NULL,
+    input_name           TEXT NOT NULL,
+    source_item_status   TEXT NOT NULL,
+    source_accepted_name TEXT,
+    attribution_fixed    INTEGER NOT NULL CHECK (attribution_fixed IN (0, 1)),
+    PRIMARY KEY (analysis_id, line_no)
+);
+
+CREATE TABLE IF NOT EXISTS richness_analysis_witness (
+    analysis_id           INTEGER NOT NULL REFERENCES richness_analysis(analysis_id) ON DELETE CASCADE,
+    bound                 TEXT NOT NULL CHECK (bound IN ('min', 'max')),
+    accepted_names_json   TEXT NOT NULL,
+    assignments_json      TEXT NOT NULL,
+    accepted_name_count   INTEGER NOT NULL,
+    PRIMARY KEY (analysis_id, bound)
+);
 """
 
 

@@ -59,6 +59,10 @@ class ResultCreate(BaseModel):
     revision_id: int | None = Field(None, description="分类表修订 ID，缺省使用当前最新修订")
 
 
+class RichnessAnalysisCreate(BaseModel):
+    result_id: int = Field(..., description="当前供数结果号（分析固定使用该结果所属的分类表修订）")
+
+
 # ---------- 响应模型 ----------
 
 class ObservationOut(BaseModel):
@@ -129,3 +133,71 @@ class ResultSummaryOut(BaseModel):
 
 class ResultDetailOut(ResultSummaryOut):
     items: list[ResultItemOut]
+
+
+# ---------- 丰富度分析 ----------
+
+class NameChoiceOut(BaseModel):
+    """一种观测名的一个候选接受名归属及代表观测。"""
+
+    observation_name: str = Field(..., description="观测名（去重后的一种名称）")
+    accepted_name: str = Field(..., description="该观测名在本次归属中选定的候选接受名")
+    observation_codes: list[str] = Field(
+        ..., description="同名的全部观测编号（同名记录必须同选，故一并列出）"
+    )
+
+
+class RichnessWitnessOut(BaseModel):
+    """一种合法候选归属的完整见证。"""
+
+    accepted_names: list[str] = Field(..., description="该方案下全部被使用的不同接受名")
+    accepted_name_count: int = Field(..., description="不同接受名总数（去重后）")
+    assignments: list[NameChoiceOut] = Field(
+        ..., description="每个观测名 -> 候选接受名的完整归属"
+    )
+
+
+class RichnessObservationOut(BaseModel):
+    observation_code: str
+    input_name: str
+    source_item_status: str = Field(..., description="来源供数结果中的原状态")
+    source_accepted_name: str | None = Field(
+        None, description="来源供数结果中已纳入记录的接受名（保留原归属）"
+    )
+    candidate_accepted_names: list[str] = Field(
+        ..., description="该观测名可达的接受名终点（已纳入记录为保留原归属）"
+    )
+    attribution_fixed: bool = Field(
+        ...,
+        description=(
+            "该观测名在来源结果中已有纳入记录，归属固定为原接受名、不参与选择；"
+            "无论是否固定，其接受名都计入丰富度"
+        ),
+    )
+
+
+class RichnessAnalysisOut(BaseModel):
+    analysis_id: int
+    result_id: int
+    revision_id: int
+    status: str
+    created_at: str
+    observation_name_count: int
+    candidate_name_count: int
+    lower_bound: int
+    upper_bound: int
+    observations: list[RichnessObservationOut]
+    min_witness: RichnessWitnessOut
+    max_witness: RichnessWitnessOut
+
+
+class RichnessAnalysisSummaryOut(BaseModel):
+    analysis_id: int
+    result_id: int
+    revision_id: int
+    status: str
+    created_at: str
+    observation_name_count: int
+    candidate_name_count: int
+    lower_bound: int
+    upper_bound: int

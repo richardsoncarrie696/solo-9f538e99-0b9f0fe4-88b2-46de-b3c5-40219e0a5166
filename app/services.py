@@ -1,19 +1,33 @@
 """业务服务：所有写操作均在单个 IMMEDIATE 事务内完成，失败整体回滚。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from .database import immediate_tx
 from .models import BatchCreate, ResultCreate, TaxonomyCreate
-from .resolver import resolve_name
+from .resolver import analyze_endpoints, resolve_name
+from .richness import RichnessComputation, compute_richness
 
 
 class ConflictError(Exception):
-    """409 冲突：唯一编号重复等。"""
+    """409 冲突：唯一编号重复、来源结果不是当前供数等。"""
 
 
 class NotFoundError(Exception):
-    """404：引用的批次或修订不存在。"""
+    """404：引用的批次、修订、结果或分析不存在。"""
+
+
+def _expire_analyses_of_expired_results(conn: sqlite3.Connection) -> None:
+    """来源结果过期的分析一并过期。"""
+    conn.execute(
+        """
+        UPDATE richness_analysis
+           SET status = 'expired'
+         WHERE status = 'active'
+           AND result_id IN (SELECT result_id FROM result WHERE status = 'expired')
+        """
+    )
 
 
 # ---------- 观测批次 ----------
@@ -113,6 +127,7 @@ def create_taxonomy_revision(
             """,
             (revision_id,),
         )
+        _expire_analyses_of_expired_results(conn)
     return revision_id
 
 
@@ -245,6 +260,7 @@ def generate_result(conn: sqlite3.Connection, payload: ResultCreate) -> int:
                 """,
                 (payload.batch_id, result_id),
             )
+        _expire_analyses_of_expired_results(conn)
     return result_id
 
 
@@ -273,3 +289,207 @@ def list_results(
         params.append(status)
     sql += " ORDER BY result_id"
     return conn.execute(sql, params).fetchall()
+
+
+# ---------- 丰富度分析 ----------
+
+def _load_result_items(conn: sqlite3.Connection, result_id: int) -> list[dict]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM result_item WHERE result_id = ? ORDER BY line_no", (result_id,)
+        )
+    ]
+
+
+def _insert_analysis(
+    conn: sqlite3.Connection,
+    result_id: int,
+    revision_id: int,
+    computation: RichnessComputation,
+    status: str = "active",
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO richness_analysis(
+            result_id, revision_id, status,
+            observation_name_count, candidate_name_count, lower_bound, upper_bound
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            result_id,
+            revision_id,
+            status,
+            computation.name_count,
+            computation.candidate_count,
+            computation.lower_bound,
+            computation.upper_bound,
+        ),
+    )
+    analysis_id = cur.lastrowid
+    conn.executemany(
+        """
+        INSERT INTO richness_analysis_name(
+            analysis_id, observation_name, candidate_names_json, fixed_attribution
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                analysis_id,
+                scope.observation_name,
+                json.dumps(list(scope.candidate_accepted_names), ensure_ascii=False),
+                1 if scope.fixed else 0,
+            )
+            for scope in computation.observation_names
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO richness_analysis_observation(
+            analysis_id, line_no, observation_code, input_name,
+            source_item_status, source_accepted_name, attribution_fixed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                analysis_id,
+                obs.line_no,
+                obs.observation_code,
+                obs.input_name,
+                obs.source_item_status,
+                obs.source_accepted_name,
+                1 if obs.attribution_fixed else 0,
+            )
+            for obs in computation.observations
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO richness_analysis_witness(
+            analysis_id, bound, accepted_names_json, assignments_json, accepted_name_count
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                analysis_id,
+                bound,
+                json.dumps(list(witness.accepted_names), ensure_ascii=False),
+                json.dumps(
+                    [
+                        {
+                            "observation_name": name,
+                            "accepted_name": accepted,
+                            "observation_codes": list(codes),
+                        }
+                        for name, accepted, codes in witness.assignments
+                    ],
+                    ensure_ascii=False,
+                ),
+                witness.accepted_name_count,
+            )
+            for bound, witness in (
+                ("min", computation.min_witness),
+                ("max", computation.max_witness),
+            )
+        ],
+    )
+    return analysis_id
+
+
+def create_richness_analysis(conn: sqlite3.Connection, result_id: int) -> int:
+    """基于供数结果生成丰富度分析。
+
+    - 只读来源结果与固定修订，不改变任何 result / result_item 行；
+    - 计算在事务外完成（纯读、修订不可变），计算期间分类更正仍可完成；
+    - 计算前来源必须是当前供数；计算期间来源过期（“迟到保存”）时，
+      分析仍按已固定范围与见证落库并标为 expired。
+    - 任何失败整体回滚，不留下部分分析。
+    """
+    result = get_result(conn, result_id)
+    if result is None:
+        raise NotFoundError(f"供数结果不存在：result_id={result_id}")
+    if result["status"] != "active":
+        raise ConflictError(
+            f"供数结果已过期，不能作为丰富度分析来源：result_id={result_id}"
+        )
+
+    revision_id = result["revision_id"]
+    items = _load_result_items(conn, result_id)
+    accepted, adjacency = _load_revision_graph(conn, revision_id)
+    computation = compute_richness(items, accepted, adjacency, analyze_endpoints)
+
+    with immediate_tx(conn):
+        current = conn.execute(
+            "SELECT status FROM result WHERE result_id = ?", (result_id,)
+        ).fetchone()
+        if current is None:
+            raise NotFoundError(f"供数结果不存在：result_id={result_id}")
+        latest = conn.execute(
+            "SELECT MAX(revision_id) AS rid FROM taxonomy_revision"
+        ).fetchone()["rid"]
+        still_current = current["status"] == "active" and latest == revision_id
+        analysis_id = _insert_analysis(
+            conn, result_id, revision_id, computation, "active" if still_current else "expired"
+        )
+    return analysis_id
+
+
+def get_richness_analysis(
+    conn: sqlite3.Connection, analysis_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM richness_analysis WHERE analysis_id = ?", (analysis_id,)
+    ).fetchone()
+
+
+def list_richness_analyses(
+    conn: sqlite3.Connection,
+    result_id: int | None = None,
+    status: str | None = None,
+) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM richness_analysis WHERE 1=1"
+    params: list = []
+    if result_id is not None:
+        sql += " AND result_id = ?"
+        params.append(result_id)
+    if status is not None:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY analysis_id"
+    return conn.execute(sql, params).fetchall()
+
+
+def richness_analysis_observations(
+    conn: sqlite3.Connection, analysis_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM richness_analysis_observation
+         WHERE analysis_id = ? ORDER BY line_no
+        """,
+        (analysis_id,),
+    ).fetchall()
+
+
+def richness_analysis_names(
+    conn: sqlite3.Connection, analysis_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM richness_analysis_name
+         WHERE analysis_id = ? ORDER BY rowid
+        """,
+        (analysis_id,),
+    ).fetchall()
+
+
+def richness_analysis_witness(
+    conn: sqlite3.Connection, analysis_id: int, bound: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM richness_analysis_witness
+         WHERE analysis_id = ? AND bound = ?
+        """,
+        (analysis_id, bound),
+    ).fetchone()

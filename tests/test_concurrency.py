@@ -8,6 +8,7 @@
 4. 最新修订下的 active 结果（若存在）与串行重算结果一致。
 """
 import os
+import json
 import tempfile
 import threading
 
@@ -146,3 +147,94 @@ def test_failed_generation_leaves_no_partial_result():
         pass
     assert len(services.list_results(conn)) == before
     conn.close()
+
+
+def test_richness_analysis_under_concurrent_correction():
+    """分析生成与分类更正交错：无部分分析；来源结果过期的分析也必过期。"""
+    admin_conn, db_file = _make_db()
+    batch_id = services.create_batch(
+        admin_conn, BatchCreate(observations=OBSERVATIONS, note="丰富度并发")
+    )
+    services.create_taxonomy_revision(admin_conn, _build_taxonomy(0))
+    result_id = services.generate_result(admin_conn, ResultCreate(batch_id=batch_id))
+    # 环名x 在来源结果中为 pending，其可达子图有环 -> 分析会被拒绝；
+    # 先换成只含可解析观测名的批次作为分析对象。
+    clean = services.create_batch(
+        admin_conn,
+        BatchCreate(
+            observations=[
+                ObservationIn(code="o1", name="旧名甲"),
+                ObservationIn(code="o2", name="分叉名"),
+                ObservationIn(code="o5", name="菱形名"),
+                ObservationIn(code="o6", name="接受名A"),
+            ]
+        ),
+    )
+    clean_result = services.generate_result(admin_conn, ResultCreate(batch_id=clean))
+
+    errors: list[Exception] = []
+    conflicts: list[Exception] = []
+    barrier = threading.Barrier(4)
+
+    def worker(worker_id: int, iterations: int, do_corrections: bool):
+        conn = connect(db_file)
+        try:
+            barrier.wait()
+            for i in range(iterations):
+                if do_corrections and i % 2 == 0:
+                    services.create_taxonomy_revision(
+                        conn, _build_taxonomy(worker_id * 100 + i)
+                    )
+                else:
+                    # 每轮都重新生成一份当前结果再分析，避免因来源过期整批 409
+                    try:
+                        rid = services.generate_result(
+                            conn, ResultCreate(batch_id=clean)
+                        )
+                        services.create_richness_analysis(conn, rid)
+                    except services.ConflictError as exc:
+                        conflicts.append(exc)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(target=worker, args=(1, 20, True)),
+        threading.Thread(target=worker, args=(2, 20, True)),
+        threading.Thread(target=worker, args=(3, 20, False)),
+        threading.Thread(target=worker, args=(4, 20, False)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"并发期间出现异常: {errors[:3]}"
+
+    analyses = services.list_richness_analyses(admin_conn)
+    assert analyses, "并发期间应至少完成一次分析"
+    for row in analyses:
+        # 无部分分析：范围、来源观测与两端见证齐全
+        names = services.richness_analysis_names(admin_conn, row["analysis_id"])
+        obs = services.richness_analysis_observations(admin_conn, row["analysis_id"])
+        assert len(names) == row["observation_name_count"]
+        assert len(obs) == 4
+        for bound in ("min", "max"):
+            w = services.richness_analysis_witness(admin_conn, row["analysis_id"], bound)
+            assert w is not None
+            assert w["accepted_name_count"] == len(json.loads(w["accepted_names_json"]))
+        source = services.get_result(admin_conn, row["result_id"])
+        assert source is not None
+        if source["status"] == "expired":
+            assert row["status"] == "expired"
+
+    # 收尾：来源过期的分析不得残留为 active
+    services.create_taxonomy_revision(admin_conn, _build_taxonomy(999))
+    for row in services.list_richness_analyses(admin_conn, status="active"):
+        source = services.get_result(admin_conn, row["result_id"])
+        assert source["status"] == "active"
+        assert row["revision_id"] == source["revision_id"] == services.latest_revision_id(
+            admin_conn
+        )
+    admin_conn.close()
